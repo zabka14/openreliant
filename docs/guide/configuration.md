@@ -79,7 +79,6 @@ OpenReliant improves on the original's look and sound. `--original` turns the im
 | Option | Description |
 |---|---|
 | `--no-mods` | Start without the mods in the game's `mods` folder ([Modding](modding.md)) |
-| `--mods-catalogue <url>` | The URL of the catalogue of mods on the web, a `mods.json` index, which the mods screen's GET MODS button opens ([Getting mods from the catalogue](modding.md#getting-mods-from-the-catalogue)). The OpenReliant mods site's by default; `none` hides GET MODS |
 | `--no-intro` | Start without the three movies the game plays as it starts, as `--mission` and `--screenshot` do |
 | `--developer-mode` | The tools for writing mods' scripts: the scripting console, which F11 brings up where a mod has scripts, and folder mods' scripts reloading when they or their shaders are saved ([Scripting](scripting.md#the-console)) |
 | `--screenshot <file.png>` | Draw one frame, with the camera settled, to a PNG, and quit; the controls, the `[OpenReliant]` settings and the details in `[Device]` are not read, so that it comes out the same each time |
@@ -192,7 +191,15 @@ Samples=8
 | `DeveloperMode` | 1 or 0; 0 by default | `--developer-mode` |
 | `TextureCompression` | 1 or 0; 1 by default: the mods' pictures compressed for the GPU ([Modding](modding.md#compression)) | `--uncompressed-textures` |
 
-The mods screen keeps which mods are on, and the order they load in, in a section of its own, `[OpenReliantMods]` ([The mods screen](modding.md#the-mods-screen)).
+The mods screen keeps which mods are on, and the order they load in, in a section of its own, `[OpenReliantMods]` ([The mods screen](modding.md#the-mods-screen)). The GET MODS screen reads the repositories of mods on the web from `[OpenReliantModRepositories]`, one line for each: a name of your choosing, and the URL of its `mods.json` ([Repositories](modding.md#repositories)). Without the section, it reads OpenReliant's own repository; an empty section hides GET MODS. It records the mods it installs in `[OpenReliantInstalledMods]`, one line for each: the archive's name, and the repository it came from. OpenReliant refuses a recorded archive whose checksum file is missing or doesn't match ([Getting mods from the catalogue](modding.md#getting-mods-from-the-catalogue)).
+
+```ini
+[OpenReliantModRepositories]
+openreliant-mods=https://openreliant.github.io/openreliant-mods/mods.json
+
+[OpenReliantInstalledMods]
+viper.hog=openreliant-mods
+```
 
 In the example, the game has the original's look and sound, but with the bloom and eight samples a pixel. A setting you leave out keeps its default, or `Original`'s where it is 1.
 

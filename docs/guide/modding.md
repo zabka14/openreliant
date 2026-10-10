@@ -184,45 +184,81 @@ You can also edit it by hand.
 
 ### Getting mods from the catalogue
 
-GET MODS, above the list on the mods screen, opens the catalogue of mods on the web: the mods on
-[OpenReliant's mods page](https://openreliant.github.io/openreliant-mods/), read from its
-`mods.json` index. The screen lists them like the mods screen does, grouped under the site's top
-categories (SHIPS, MISSIONS, ...); a click on a heading folds the group, and another unfolds it.
-The panel shows the chosen mod's thumbnail, version, author, full category, the OpenReliant
-version it needs, its size and its description. INSTALL downloads the mod's archive and its
-checksum file into the `mods` folder, and checks the archive against the checksum before putting
-it in place, so the mod loads exactly like one copied there by hand. UPDATE does the same for a mod
-that is installed in an older version, shown in gold in the list, with the panel saying which
-version is installed and which one the update brings. A mod that needs a newer OpenReliant is red
-and can't be installed. RELOAD reads the catalogue again. One download runs at a time: INSTALL and
-RELOAD wait for it. OK goes back to the mods screen, which now lists the installed mods. Like every
-change on the mods screen, they take effect at the next start.
+GET MODS, above the list on the mods screen, opens the catalogue of mods on the web: the mods that
+[OpenReliant's mods page](https://openreliant.github.io/openreliant-mods/) lists in its `mods.json`
+index, and those of any other repository you add ([Repositories](#repositories)). The screen lists
+them like the mods screen does, grouped under the site's top categories (SHIPS, MISSIONS, ...); a
+click on a heading folds the group, and another unfolds it. The panel shows the chosen mod's
+thumbnail, version, author, full category, the repository that lists it, the OpenReliant version it
+needs, its size and its description. INSTALL downloads the mod's archive into the `mods` folder,
+checks it against the digest the catalogue gives, and writes the digest next to the archive as its
+checksum file ([Checksums](#checksums)), so the archive is checked again each time OpenReliant
+starts. UPDATE does the same for a mod that is installed in an older version, shown in gold in the
+list, with the panel saying which version is installed and which one the update brings. A mod that
+needs a newer OpenReliant is red and can't be installed. A mod you copied into the `mods` folder as
+a folder is left alone, and the panel says so, since OpenReliant would load both the folder and the
+archive. RELOAD reads the repositories again. One download runs at a time: INSTALL and RELOAD wait
+for it. OK goes back to the mods screen, which now lists the installed mods. Like every change on
+the mods screen, they take effect at the next start.
 
 The catalogue and the downloads run in the background, so the menus keep working, and the panel
 shows the download's progress. OpenReliant connects to the web only for this screen: to read the
-catalogue, and to download the mods you install. `--mods-catalogue <url>` reads another catalogue,
-such as one of your own, and `--mods-catalogue none` hides GET MODS. The screen lists at most 127
+repositories, and to download the mods you install. Everything is downloaded over HTTPS: a plain
+`http` link is changed to `https` before it is requested, and so is every redirect, so nothing is
+read in plain text, and plain HTTP never replaces HTTPS when HTTPS fails. Only a repository on your
+own machine (`localhost`, `127.0.0.1` or `::1`) is read over plain HTTP. The screen lists at most 127
 mods. A download can't be cancelled yet
 ([#1040](https://github.com/OpenReliant/openreliant/issues/1040)), and the mods screen doesn't say
 yet which of its mods have an update
 ([#1041](https://github.com/OpenReliant/openreliant/issues/1041)).
 
+OpenReliant records the mods GET MODS installs in `starlancer.ini`, in the section
+`[OpenReliantInstalledMods]`, one line for each: the archive's name, and the repository it came
+from. A recorded archive loads only with its checksum file next to it, and only if it matches; one
+whose checksum file is missing or doesn't match is listed in red on the mods screen as damaged,
+like a damaged archive you copied in by hand. A mod you copied in by hand isn't recorded, and loads
+unchecked when it has no checksum file. Delete a mod's line to treat it as copied in by hand.
+
+```ini
+[OpenReliantInstalledMods]
+viper.hog=openreliant-mods
+```
+
+#### Repositories
+
+A repository is a `mods.json` index on the web. OpenReliant reads the repositories that
+`starlancer.ini` names in `[OpenReliantModRepositories]`, one line for each: a name of your
+choosing, and the URL of its index, in the order the screen reads them.
+
+```ini
+[OpenReliantModRepositories]
+openreliant-mods=https://openreliant.github.io/openreliant-mods/mods.json
+mine=https://example.com/mods/mods.json
+```
+
+Without the section, OpenReliant reads its own repository, `openreliant-mods`, alone. With it,
+OpenReliant reads what it lists, so you can add repositories, or leave ours out. An empty section
+hides GET MODS. The screen lists the mods of every repository together. Where two repositories
+list the same id, the first one listed wins, and the log names the mod left out. A repository that
+can't be read is named in red above the list, with the reason, while the others' mods are listed.
+
 #### The catalogue's format
 
 `mods.json` is a JSON object with a `format` of 1 (the default when the key is missing) and a `mods`
-list. Each mod is an object. `id` and `archive` are required, the other keys are optional, and keys
-OpenReliant doesn't know are ignored, as the top-level `generated` key is, which says when the index
-was written.
+list. A catalogue in a newer format tells the player to update OpenReliant. Each mod is an object.
+`id`, `archive`, `sha256` and `size` are required: a mod that lacks one is skipped, with a line in
+the log. The other keys are optional, and keys OpenReliant doesn't know are ignored, as the
+top-level `generated` key is, which says when the index was written.
 
 | Key | What it is |
 |---|---|
-| `id` | The mod's name in the `mods` folder. Its archive is named `<id>.hog`. A mod whose id can't be a file name is skipped |
+| `id` | The mod's name in the `mods` folder. Its archive is named `<id>.hog`. A mod is skipped when its id can't be a file name, starts with a dot, is one of Windows's device names such as `con`, even with an extension as `con.v2`, or can't be a key of `starlancer.ini` (an equals sign, a leading bracket, spaces at either end) |
 | `name`, `version`, `author`, `description`, `openreliant` | The same values as the manifest's keys of those names ([The manifest](#the-manifest)); `openreliant` is the OpenReliant version the mod needs |
 | `category` | The site's category, such as `ships/fighters/alliance` |
 | `updated` | The date and time of its latest release |
-| `size` | The archive's size in bytes |
-| `archive` | The URL of the archive |
-| `checksum` | The URL of its checksum file ([Checksums](#checksums)). Without one, the archive isn't checked and no checksum file is written next to it |
+| `size` | The archive's size in bytes. The download stops as soon as more arrives, or when the server announces another size |
+| `archive` | The URL of the archive, on any host. An `http` link is requested as `https` |
+| `sha256` | The archive's SHA-256 digest, as 64 hexadecimal digits, with or without the `sha256:` prefix GitHub gives a release asset's digest. The download is checked against it, and it is written as the archive's checksum file |
 | `thumbnail` | The URL of its thumbnail, a PNG ([The thumbnail](#the-thumbnail)) |
 | `url` | The URL of its web page |
 
@@ -240,13 +276,30 @@ was written.
       "openreliant": "0.7",
       "size": 5624773,
       "archive": "https://github.com/OpenReliant/openreliant-mods/releases/download/viper-v1.3/viper.hog",
-      "checksum": "https://github.com/OpenReliant/openreliant-mods/releases/download/viper-v1.3/viper.hog.sha256",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
       "thumbnail": "https://openreliant.github.io/openreliant-mods/thumbs/viper.png",
       "url": "https://openreliant.github.io/openreliant-mods/mods/viper/"
     }
   ]
 }
 ```
+
+#### Hosting a repository
+
+Anyone can host a repository:
+
+- Publish `mods.json` over HTTPS. A static site works, such as GitHub Pages.
+- Link each archive over HTTPS, from anywhere: a release on GitHub, or any other host. Give its
+  `sha256` digest and its `size`, which pin the exact archive the index lists, wherever it lives.
+- Keep the ids unique: a mod's id is its name in the `mods` folder, and OpenReliant loads one mod
+  of a name.
+- Tell players to add the repository to `starlancer.ini` ([Repositories](#repositories)). To try
+  it on your own machine first, serve the files at `http://127.0.0.1`, the one kind of address
+  OpenReliant reads over plain HTTP.
+
+The site generator of [openreliant-mods](https://github.com/OpenReliant/openreliant-mods), in
+`.github/scripts/site.py`, writes the index from the collection's releases, and can serve as the
+example.
 
 ## How files are replaced
 

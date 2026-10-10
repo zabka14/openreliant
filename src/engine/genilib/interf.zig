@@ -70,8 +70,8 @@ pub const Screen = enum(u8) {
     /// names stands in for it. Without one, the front end goes straight on to the main menu.
     mode_ending = 104,
     /// OpenReliant's GET MODS screen (`mod_catalogue`): the catalogue of mods on the web, opened by
-    /// the mods screen's GET MODS button.
-    mod_catalogue = 105,
+    /// the mods screen's GET MODS button. Scripts see the tag's name, so it has American spelling.
+    mod_catalog = 105,
     _,
 
     pub fn format(screen: Screen, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -258,7 +258,7 @@ fn screenFiles(screen: Screen) ?struct { shapes: []const u8, background: []const
         .audio => .{ .shapes = settings.shapes_name, .background = settings.opening(.game_options, .audio).?.background },
         .controls => .{ .shapes = settings.shapes_name, .background = settings.opening(.game_options, .controls).?.background },
         .video => .{ .shapes = settings.shapes_name, .background = settings.opening(.game_options, .video).?.background },
-        .mods, .mod_options, .mod_catalogue => .{ .shapes = settings.shapes_name, .background = mod_manager.opening.background },
+        .mods, .mod_options, .mod_catalog => .{ .shapes = settings.shapes_name, .background = mod_manager.opening.background },
         .game_modes, .mode_briefing, .mode_ending => .{ .shapes = settings.shapes_name, .background = game_modes.opening.background },
         .pilot_roster => .{ .shapes = pilot_roster.shapes_name, .background = pilot_roster.background_name },
         .saved_games => .{ .shapes = saved_games.shapes_name, .background = saved_games.opening(.roster).background },
@@ -439,11 +439,11 @@ pub const Interface = struct {
                         front.options_of = mod;
                         front.screen = .mod_options;
                     },
-                    .catalogue => front.screen = .mod_catalogue,
+                    .catalogue => front.screen = .mod_catalog,
                 }
                 return null;
             },
-            .mod_catalogue => {
+            .mod_catalog => {
                 const mods = context.mods orelse return front.backToOptions();
                 const settings_file = context.settings orelse return front.backToOptions();
                 const left = front.mod_catalogue.frame(catalogueContext(front, context, settings_file, mods, pointer)) orelse return null;
@@ -609,7 +609,7 @@ pub const Interface = struct {
             .main_menu, .game_options, .pilot_roster => true,
             .audio, .controls, .video => context.settings != null,
             .mods, .mod_options => context.settings != null and context.mods != null,
-            .mod_catalogue => context.settings != null and context.mods != null and context.mods.?.catalogue != null,
+            .mod_catalog => context.settings != null and context.mods != null and game.bigfile.catalogue.Repositories.of(context.settings.?.profile).any(),
             .saved_games => context.saves != null,
             .game_modes => context.modes.len > 0,
             .briefing, .landing_movie, .connection, .mode_briefing, .mode_ending, _ => false,
@@ -652,7 +652,7 @@ pub const Interface = struct {
                 if (front.mods_installed) front.mod_manager.refresh(mods_context) catch |err| log.warn("the mods folder can't be read again: {s}", .{@errorName(err)});
                 front.mods_installed = false;
             },
-            .mod_catalogue => if (context.settings) |settings_file| if (context.mods) |mods| front.mod_catalogue.enter(catalogueContext(front, context, settings_file, mods, front.pointer)),
+            .mod_catalog => if (context.settings) |settings_file| if (context.mods) |mods| front.mod_catalogue.enter(catalogueContext(front, context, settings_file, mods, front.pointer)),
             .mod_options => if (context.mods) |mods| {
                 const shown = front.mod_options.enter(front.options_of, optionsContext(front, context, mods, front.pointer));
                 if (!shown) front.screen = .mods;
@@ -689,8 +689,8 @@ pub const Interface = struct {
         if (front.entered == .pilot_roster) pilot_roster.Roster.leave(context.typed);
         // The mods screen keeps what REFRESH opened while a mod's options or the catalogue are shown,
         // and frees it when any of the three is left for another screen.
-        const to_own = front.entered == .mods and (front.screen == .mod_options or front.screen == .mod_catalogue);
-        if ((front.entered == .mods or front.entered == .mod_options or front.entered == .mod_catalogue) and !to_own) front.mod_manager.release();
+        const to_own = front.entered == .mods and (front.screen == .mod_options or front.screen == .mod_catalog);
+        if ((front.entered == .mods or front.entered == .mod_options or front.entered == .mod_catalog) and !to_own) front.mod_manager.release();
         front.entered = null;
     }
 
@@ -746,7 +746,7 @@ pub const Interface = struct {
             .audio, .controls, .video => try front.settings.draw(drawn, art, &resources.dialog, shown, front.pointer),
             .mods => try front.mod_manager.draw(drawn, art, front.pointer),
             .mod_options => try front.mod_options.draw(drawn, art, front.pointer),
-            .mod_catalogue => try front.mod_catalogue.draw(drawn, art, front.pointer),
+            .mod_catalog => try front.mod_catalogue.draw(drawn, art, front.pointer),
             .game_modes => try front.game_modes.draw(drawn, art, front.pointer),
             .pilot_roster => try front.pilot_roster.draw(drawn, art, &resources.dialog, front.pointer, front.pilot),
             .saved_games => try front.saved_games.draw(drawn, art, &resources.dialog, front.pointer, front.pilot.call_sign.slice()),
@@ -1016,4 +1016,56 @@ test "without a mod's screen, a game mode's briefing goes straight on to the mis
     front.ending();
     try std.testing.expectEqual(Outcome.mode_left, front.frame(.{ .devices = &devices, .typed = &typed, .window = .{ 640, 480 }, .elapsed = 1 }).?);
     try std.testing.expectEqual(Screen.main_menu, front.screen);
+}
+
+test "back from GET MODS, the mods screen rereads the mods folder when a mod was installed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "mods/alpha");
+    var mods: game.bigfile.Mods = try .open(gpa, io, tmp.dir, null);
+    defer mods.close(gpa);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    // The settings file names no repository, so the GET MODS screen reads nothing from the web.
+    var settings_file: profile.File = .{ .arena = arena.allocator(), .profile = .{ .text = "[OpenReliantModRepositories]\n" } };
+    var recorder: mod_options.Recorder = .{ .mod = "", .page = .{ .title = "", .options = &.{} } };
+    var devices: input.Devices = .{};
+    var typed: winmain.Typed = .{};
+    var front: Interface = .{ .screen = .mod_catalog };
+    defer front.deinit();
+    const context: Context = .{
+        .devices = &devices,
+        .typed = &typed,
+        .window = .{ 640, 480 },
+        .elapsed = 1,
+        .settings = &settings_file,
+        .mods = .{ .loaded = &mods, .gpa = gpa, .io = io, .game = tmp.dir, .version = null, .pages = recorder.pages() },
+    };
+    front.enterShown(context);
+    try std.testing.expectEqual(Screen.mod_catalog, front.entered);
+    // Escape leaves for the mods screen, telling it that a mod was installed meanwhile.
+    front.mod_catalogue.installed_any = true;
+    devices.keyboard.down[input.scan.escape] = true;
+    try std.testing.expectEqual(null, front.frame(context));
+    try std.testing.expectEqual(Screen.mods, front.screen);
+    try std.testing.expect(front.mods_installed);
+    devices.keyboard.down[input.scan.escape] = false;
+    devices.keyboard.read();
+    // Entered, the mods screen lists the mod added since OpenReliant started, as REFRESH would.
+    try tmp.dir.createDirPath(io, "mods/beta");
+    front.enterShown(context);
+    try std.testing.expectEqual(Screen.mods, front.entered);
+    try std.testing.expectEqual(2, front.mod_manager.count);
+    try std.testing.expect(!front.mods_installed);
+    // Back from GET MODS without an install, it lists the mods OpenReliant started with.
+    front.screen = .mod_catalog;
+    front.enterShown(context);
+    devices.keyboard.down[input.scan.escape] = true;
+    try std.testing.expectEqual(null, front.frame(context));
+    try std.testing.expectEqual(Screen.mods, front.screen);
+    try std.testing.expect(!front.mods_installed);
+    front.enterShown(context);
+    try std.testing.expectEqual(1, front.mod_manager.count);
 }

@@ -1,17 +1,20 @@
 //! The GET MODS screen (`ModCatalogue`), opened by the GET MODS button of the mods screen. It lists
-//! the mods of the catalogue on the web (`bigfile.catalogue`) in a list like the mods screen's,
-//! grouped by top category (SHIPS, MISSIONS, ...) under headings that fold and unfold, with the
-//! chosen mod's thumbnail, version, author, category, size and description in the panel next to
-//! it. INSTALL downloads the chosen mod's archive into the `mods` folder and checks it against its
-//! checksum file, showing the progress in the panel. UPDATE does the same for a mod that is
-//! installed in an older version. RELOAD reads the catalogue again. The catalogue and the
-//! downloads run on other threads, so the screen keeps running while they come in. One download
+//! the mods of the catalogue on the web (`bigfile.catalogue`), read from the repositories that
+//! `starlancer.ini` names, in a list like the mods screen's, grouped by top category (SHIPS,
+//! MISSIONS, ...) under headings that fold and unfold, with the chosen mod's thumbnail, version,
+//! author, category, repository, size and description in the panel next to it. INSTALL downloads
+//! the chosen mod's archive into the `mods` folder, checks it against the catalogue's digest and
+//! records in `starlancer.ini` which repository it came from, showing the progress in the panel.
+//! UPDATE does the same for a mod that is installed in an older version. RELOAD reads the
+//! repositories again. The indexes and the downloads run on other threads, so the screen keeps
+//! running while they come in. The repositories are read one after another, and one download
 //! runs at a time: INSTALL and RELOAD wait for it.
 //!
 //! The screen uses the mods screen's layout and shapes: the framed list with its arrows, the
 //! panel, and the settings screen's buttons. OK goes back to the mods screen, which rereads the
 //! `mods` folder if a mod was installed. MAIN MENU leaves. A mod that needs a newer OpenReliant is
-//! listed in red and can't be installed.
+//! listed in red and can't be installed, and a folder mod of the same name, copied in by hand, is
+//! left as it is: the loader would load both it and the archive.
 //!
 //! Not yet: cancelling a download that runs
 //! ([#1040](https://github.com/OpenReliant/openreliant/issues/1040)), and updates shown on the
@@ -28,6 +31,9 @@ const profile = @import("../../profile.zig");
 const bigfile = @import("../bigfile.zig");
 const checksums = @import("../../../formats/checksums.zig");
 const catalogue = bigfile.catalogue;
+const Repositories = catalogue.Repositories;
+const Order = bigfile.mods.Order;
+const hog = @import("../../../formats/hog.zig");
 const hud = @import("../hud.zig");
 const canvas_module = @import("canvas.zig");
 const Canvas = canvas_module.Canvas;
@@ -87,12 +93,17 @@ const name_buffer = mod_manager.name_buffer;
 const title: Label = .{ .text = .{ .words = "GET MODS" }, .at = .{ 320, settings.title_y }, .alignment = .centre };
 
 /// The notes the list shows while the catalogue downloads, when it can't be read, and when it is
-/// empty.
-const reading_note: Label = .{ .text = .{ .words = "READING THE CATALOGUE" }, .at = list_middle, .alignment = .centre };
-const unreadable_note: Label = .{ .text = .{ .words = "CAN'T READ THE CATALOGUE" }, .at = list_middle, .alignment = .centre };
-const empty_note: Label = .{ .text = .{ .words = "THE CATALOGUE OFFERS NO MODS" }, .at = list_middle, .alignment = .centre };
+/// empty. Words OpenReliant adds to the screens use American spelling.
+const reading_note: Label = .{ .text = .{ .words = "READING THE CATALOG" }, .at = list_middle, .alignment = .centre };
+const unreadable_note: Label = .{ .text = .{ .words = "CAN'T READ THE CATALOG" }, .at = list_middle, .alignment = .centre };
+const empty_note: Label = .{ .text = .{ .words = "THE CATALOG OFFERS NO MODS" }, .at = list_middle, .alignment = .centre };
 /// Where the second line of the list's note goes: the reason the catalogue can't be read.
 const note_below: [2]i32 = .{ list_middle[0], list_middle[1] + row_spacing };
+/// Where the note about a repository that can't be read goes, while the others' mods are listed:
+/// above the list, ending at the panel's right edge like the mods screen's RESTART TO APPLY.
+const repository_note_at: [2]i32 = .{ details_frame.at[0] + details_frame.extent[0], list_frame.at[1] - mod_manager.restart_note_above };
+/// The note the panel shows for a folder mod copied in by hand, which INSTALL leaves alone.
+const by_hand_note = "INSTALLED BY HAND AS A FOLDER: INSTALL WON'T REPLACE IT";
 
 /// The note the panel shows when no mod is chosen.
 const choose_note: Label = .{ .text = .{ .words = "CHOOSE A MOD" }, .at = details_middle, .alignment = .centre };
@@ -144,10 +155,23 @@ const Action = enum { install, update, none };
 const Status = union(enum) {
     /// Not in the folder.
     absent,
-    /// In the folder, with this version as its manifest writes it; null when the manifest gives
-    /// none.
-    installed: ?[]const u8,
+    installed: Installed,
 };
+
+/// A mod of the catalogue that is in the `mods` folder.
+const Installed = struct {
+    /// Its version as its manifest writes it; null when the manifest gives none.
+    version: ?[]const u8,
+    /// Whether it is a folder mod, which was copied in by hand. INSTALL and UPDATE leave it alone,
+    /// since the loader would load both it and the archive.
+    folder: bool,
+    /// The repository GET MODS installed it from, as the settings file records it; null for a mod
+    /// copied in by hand.
+    repository: ?[]const u8,
+};
+
+/// A repository that couldn't be read: its name, copied with `gpa`, and why.
+const Failed = struct { gpa: Allocator, name: []u8, failure: catalogue.Failure };
 
 /// What the pointer finds on the screen.
 pub const Item = union(enum) {
@@ -173,11 +197,12 @@ const ThumbnailOf = struct { gpa: Allocator, id: []u8 };
 pub const Context = struct {
     pointer: Pointer,
     keyboard: *input.Keyboard,
-    /// `starlancer.ini`, which gives the order of the installed mods.
+    /// `starlancer.ini`, which names the repositories to read, gives the order of the installed
+    /// mods, and records the ones GET MODS installed.
     settings_file: *profile.File,
     /// The timer's ticks (`game_ticks`), used to scroll the list while an arrow is held.
     ticks: u32,
-    /// The loaded mods, how to reread them, and the catalogue's URL.
+    /// The loaded mods, and how to reread them.
     source: mod_manager.Source,
 };
 
@@ -195,12 +220,17 @@ pub const ModCatalogue = struct {
     /// The HTTP client every download uses, made when the screen first opens and kept until the
     /// front end closes.
     client: ?std.http.Client = null,
-    /// The download of the catalogue, and the catalogue once it has been read. It is kept while the
-    /// screen is left and opened again, until RELOAD.
+    /// The download of the repositories' indexes, one after another: the index of the repository
+    /// being read, by its place in the settings file's list, and the catalogue the indexes are
+    /// gathered into. Null while nothing is read.
     fetch: catalogue.Fetch = .{},
+    reading: ?usize = null,
+    gathering: ?catalogue.Catalogue = null,
+    /// The catalogue once every repository has been read. It is kept while the screen is left and
+    /// opened again, until RELOAD.
     loaded: ?catalogue.Catalogue = null,
-    /// Why the catalogue couldn't be read, if it couldn't.
-    problem: ?[]const u8 = null,
+    /// The last repository that couldn't be read, and why; shown with the list.
+    failed: ?Failed = null,
     /// The selected mod, by its index in the catalogue; the panel shows it.
     chosen: ?u8 = null,
     /// The rows of the list: a heading for each group, then the mods in it unless the group is
@@ -230,9 +260,10 @@ pub const ModCatalogue = struct {
     /// Whether a mod was installed since the mods screen was left. The mods screen then rereads the
     /// `mods` folder.
     installed_any: bool = false,
-    /// The mods in the `mods` folder, read when the screen opens and after each install. They say
-    /// which catalogue mods are installed, and in which version.
-    present: ?struct { gpa: Allocator, mods: bigfile.Mods } = null,
+    /// The mods in the `mods` folder, read when the screen opens and after each install, and what
+    /// the settings file said of them then. They say which catalogue mods are installed, in which
+    /// version, and from which repository.
+    present: ?struct { gpa: Allocator, mods: bigfile.Mods, order: Order } = null,
     /// The thumbnails downloaded so far, by mod id, the download in progress, and the id of the
     /// mod it is for.
     thumbnails: mod_manager.Thumbnails = .{},
@@ -242,8 +273,8 @@ pub const ModCatalogue = struct {
     /// a newer one. Null until the screen is entered, or when the version isn't known.
     running: ?std.SemanticVersion = null,
 
-    /// Opens the screen: reads the `mods` folder, and starts downloading the catalogue if it hasn't
-    /// been read yet.
+    /// Opens the screen: reads the `mods` folder, and starts reading the repositories if the
+    /// catalogue hasn't been read yet.
     pub fn enter(screen: *ModCatalogue, context: Context) void {
         const source = context.source;
         screen.running = source.version;
@@ -255,7 +286,7 @@ pub const ModCatalogue = struct {
         screen.list = .of(screen.row_count, shown_rows, context.ticks);
         if (screen.chosen == null) screen.chosen = screen.firstMod();
         screen.scan(context);
-        if (screen.loaded == null and screen.fetch.state() == .idle) screen.startReading(source);
+        if (screen.loaded == null and screen.reading == null) screen.startReading(context);
     }
 
     /// Frees everything the screen holds, when the front end closes. The downloads are cancelled
@@ -266,8 +297,12 @@ pub const ModCatalogue = struct {
         screen.install.deinit();
         if (screen.client) |*client| client.deinit();
         screen.client = null;
+        if (screen.gathering) |*gathering| gathering.deinit();
+        screen.gathering = null;
+        screen.reading = null;
         if (screen.loaded) |*loaded| loaded.deinit();
         screen.loaded = null;
+        screen.forgetFailure();
         screen.forgetOutcome();
         if (screen.thumbnail_of) |pending| pending.gpa.free(pending.id);
         screen.thumbnail_of = null;
@@ -367,49 +402,103 @@ pub const ModCatalogue = struct {
         return writer.buffered();
     }
 
-    /// Starts downloading the catalogue from the source's URL.
-    fn startReading(screen: *ModCatalogue, source: mod_manager.Source) void {
-        const url = source.catalogue orelse return;
-        const client = screen.httpClient() orelse return;
-        screen.problem = null;
-        screen.fetch.start(source.gpa, source.io, client, url, catalogue.most_index_bytes) catch |err| {
-            log.warn("the catalogue can't be read: {s}", .{@errorName(err)});
-            screen.problem = catalogue.Failure.ofStart(err).words();
+    /// Starts reading the repositories the settings file names, the first one first (`readNext`),
+    /// into a new catalogue. Without a repository, nothing is read: GET MODS is hidden then.
+    fn startReading(screen: *ModCatalogue, context: Context) void {
+        if (!Repositories.of(context.settings_file.profile).any()) return;
+        screen.forgetFailure();
+        if (screen.gathering) |*gathering| gathering.deinit();
+        screen.gathering = .init(context.source.gpa);
+        screen.reading = 0;
+        screen.readNext(context);
+    }
+
+    /// Starts downloading the index of the repository being read, skipping one whose download
+    /// can't start, or, past the last repository, lists the catalogue gathered so far.
+    fn readNext(screen: *ModCatalogue, context: Context) void {
+        const source = context.source;
+        while (screen.reading) |index| {
+            const repository = Repositories.of(context.settings_file.profile).at(index) orelse break;
+            const client = screen.httpClient() orelse break;
+            screen.fetch.start(source.gpa, source.io, client, repository.url, catalogue.most_index_bytes) catch |err| {
+                log.warn("{s}: the catalogue can't be read: {s}", .{ repository.name, @errorName(err) });
+                screen.recordFailure(source.gpa, repository.name, catalogue.Failure.ofStart(err));
+                screen.reading = index + 1;
+                continue;
+            };
+            return;
+        }
+        screen.finishReading(context);
+    }
+
+    /// Lists the catalogue gathered from every repository, in place of the one listed before.
+    fn finishReading(screen: *ModCatalogue, context: Context) void {
+        screen.reading = null;
+        const gathered = screen.gathering orelse return;
+        screen.gathering = null;
+        if (screen.loaded) |*old| old.deinit();
+        screen.loaded = gathered;
+        screen.folded = .empty;
+        screen.makeRows();
+        screen.list = .of(screen.row_count, shown_rows, context.ticks);
+        screen.chosen = screen.firstMod();
+        const listed = gathered.entries().len;
+        log.info("the catalogue lists {d} mods", .{listed});
+        if (listed > most_mods) log.warn("the GET MODS screen lists {d} mods; the rest are left out", .{most_mods});
+    }
+
+    /// Keeps the repository `name` as the one that couldn't be read, and why. A copy of the name
+    /// that can't be made is logged and left out.
+    fn recordFailure(screen: *ModCatalogue, gpa: Allocator, name: []const u8, failure: catalogue.Failure) void {
+        screen.forgetFailure();
+        const copied = gpa.dupe(u8, name) catch {
+            log.warn("the failure to read {s} can't be kept for the screen: out of memory", .{name});
+            return;
         };
+        screen.failed = .{ .gpa = gpa, .name = copied, .failure = failure };
+    }
+
+    fn forgetFailure(screen: *ModCatalogue) void {
+        if (screen.failed) |failed| failed.gpa.free(failed.name);
+        screen.failed = null;
     }
 
     /// Reads the `mods` folder, to know which mods are installed. The OpenReliant version isn't
     /// checked: every mod found counts as installed, whichever list it lands in.
     fn scan(screen: *ModCatalogue, context: Context) void {
         const source = context.source;
-        const found: bigfile.Mods = bigfile.Mods.installed(source.gpa, source.io, source.game, null, .{ .profile = context.settings_file.profile }) catch |err| {
+        const order: Order = .{ .profile = context.settings_file.profile };
+        const found: bigfile.Mods = bigfile.Mods.installed(source.gpa, source.io, source.game, null, order) catch |err| {
             log.warn("the mods folder can't be read: {s}", .{@errorName(err)});
             return;
         };
         if (screen.present) |*present| present.mods.close(present.gpa);
-        screen.present = .{ .gpa = source.gpa, .mods = found };
+        screen.present = .{ .gpa = source.gpa, .mods = found, .order = order };
     }
 
-    /// Whether the mod `entry` is in the `mods` folder, and in which version.
+    /// Whether the mod `entry` is in the `mods` folder, in which version, as a folder or an
+    /// archive, and from which repository GET MODS installed it.
     fn statusOf(screen: ModCatalogue, entry: Entry) Status {
         const present = screen.present orelse return .absent;
         for ([_][]const Mod{ present.mods.list, present.mods.off, present.mods.damaged, present.mods.unmet }) |each| for (each) |mod| {
             if (!std.ascii.eqlIgnoreCase(mod.qualifier(), entry.id)) continue;
-            return .{ .installed = mod.about(.version) };
+            return .{ .installed = .{ .version = mod.about(.version), .folder = mod.source == .folder, .repository = present.order.installedFrom(mod.name) } };
         };
         return .absent;
     }
 
     /// What INSTALL does for the mod at `index` in the catalogue. Nothing while a download runs, when
-    /// the mod needs a newer OpenReliant, or when the installed version is the catalogue's or newer.
+    /// the mod needs a newer OpenReliant, when a folder mod of its name is installed, or when the
+    /// installed version is the catalogue's or newer.
     fn actionFor(screen: ModCatalogue, index: u8) Action {
         if (screen.installing != null) return .none;
         const entry = screen.entries()[index];
         if (entry.needsLater(screen.running) != null) return .none;
         return switch (screen.statusOf(entry)) {
             .absent => .install,
-            .installed => |version| {
-                const have = bigfile.mods.parseVersion(version orelse return .install) orelse return .install;
+            .installed => |installed| {
+                if (installed.folder) return .none;
+                const have = bigfile.mods.parseVersion(installed.version orelse return .install) orelse return .install;
                 const offered = entry.semantic() orelse return .install;
                 return if (offered.order(have) == .gt) .update else .none;
             },
@@ -422,10 +511,10 @@ pub const ModCatalogue = struct {
         return screen.actionFor(index);
     }
 
-    /// Whether RELOAD can read the catalogue again: not while it is being read, and not while a mod
-    /// downloads, since the download's mod is known by its place in the catalogue.
+    /// Whether RELOAD can read the repositories again: not while they are being read, and not
+    /// while a mod downloads, since the download's mod is known by its place in the catalogue.
     fn canReload(screen: ModCatalogue) bool {
-        return screen.installing == null and screen.fetch.state() == .idle;
+        return screen.installing == null and screen.reading == null;
     }
 
     /// One pass of the screen's loop. Collects the catalogue, the install and the thumbnail when their
@@ -463,44 +552,46 @@ pub const ModCatalogue = struct {
         return null;
     }
 
-    /// Once the catalogue has downloaded, parses it and makes the rows.
+    /// Once the index of the repository being read has downloaded, or has failed to, adds its mods
+    /// to the catalogue being gathered, and goes on to the next repository.
     fn takeCatalogue(screen: *ModCatalogue, context: Context) void {
+        const index = screen.reading orelse return;
+        const gpa = context.source.gpa;
         switch (screen.fetch.state()) {
             .idle, .running => return,
             .failed => {
-                screen.problem = screen.fetch.failure.words();
+                const name = if (Repositories.of(context.settings_file.profile).at(index)) |repository| repository.name else "";
+                screen.recordFailure(gpa, name, screen.fetch.failure.?);
                 screen.fetch.deinit();
-                return;
             },
-            .done => {},
+            .done => screen.gather(context, index),
         }
+        screen.reading = index + 1;
+        screen.readNext(context);
+    }
+
+    /// Adds the mods of the index that has downloaded, of the repository at `index` in the settings
+    /// file's list, to the catalogue being gathered. The fetch is idle afterwards.
+    fn gather(screen: *ModCatalogue, context: Context, index: usize) void {
         const gpa = context.source.gpa;
+        const repository = Repositories.of(context.settings_file.profile).at(index) orelse catalogue.Repository{ .name = "", .url = "" };
         const bytes = screen.fetch.finish() orelse {
-            screen.problem = catalogue.Failure.words(.out_of_memory);
+            screen.recordFailure(gpa, repository.name, .out_of_memory);
             return;
         };
         defer gpa.free(bytes);
-        const read = catalogue.Catalogue.parse(gpa, bytes) catch |err| {
-            log.warn("the catalogue can't be read: {s}", .{@errorName(err)});
-            screen.problem = catalogue.Failure.words(if (err == error.OutOfMemory) .out_of_memory else .bad_content);
-            return;
+        const gathering = &(screen.gathering orelse return);
+        gathering.add(repository, bytes) catch |err| {
+            log.warn("{s}: the catalogue can't be read: {s}", .{ repository.name, @errorName(err) });
+            screen.recordFailure(gpa, repository.name, .of(err));
         };
-        if (screen.loaded) |*old| old.deinit();
-        screen.loaded = read;
-        screen.folded = .empty;
-        screen.makeRows();
-        screen.list = .of(screen.row_count, shown_rows, context.ticks);
-        screen.chosen = screen.firstMod();
-        const listed = read.entries().len;
-        log.info("the catalogue lists {d} mods", .{listed});
-        if (listed > most_mods) log.warn("the GET MODS screen lists {d} mods; the rest are left out", .{most_mods});
     }
 
-    /// RELOAD: downloads the catalogue again, when it can (`canReload`).
+    /// RELOAD: reads the repositories again, when it can (`canReload`).
     fn reload(screen: *ModCatalogue, context: Context) void {
         if (!screen.canReload()) return;
         screen.scan(context);
-        screen.startReading(context.source);
+        screen.startReading(context);
     }
 
     /// INSTALL or UPDATE: starts downloading the selected mod, if there is something to do.
@@ -530,12 +621,25 @@ pub const ModCatalogue = struct {
         };
         screen.install.finish();
         screen.installing = null;
+        const entry = screen.entries()[index];
         if (failure == null) {
             screen.installed_any = true;
+            recordInstalled(context, entry);
             screen.scan(context);
         }
         screen.forgetOutcome();
-        screen.recordOutcome(context.source.gpa, screen.entries()[index].id, failure);
+        screen.recordOutcome(context.source.gpa, entry.id, failure);
+    }
+
+    /// Records in the settings file that GET MODS installed `entry`, and from which repository, so
+    /// that the loader checks the archive against its checksum file from now on
+    /// (`bigfile.order.installed_section`). A record that can't be written is logged.
+    fn recordInstalled(context: Context, entry: Entry) void {
+        var buffer: [name_buffer]u8 = undefined;
+        const archive = entry.archiveName(&buffer) catch return;
+        Order.recordInstall(context.settings_file, archive, entry.repository) catch |err| {
+            log.warn("{s}: the install isn't recorded in the settings file: {s}", .{ entry.id, @errorName(err) });
+        };
     }
 
     /// Keeps the result of the install of the mod `id` for the panel; a copy that can't be made is
@@ -580,7 +684,6 @@ pub const ModCatalogue = struct {
     /// Keeps the thumbnail whose download has ended, decoded if it came, or none if it failed, so
     /// that it isn't downloaded again. The fetch is idle afterwards.
     fn keepThumbnail(screen: *ModCatalogue, gpa: Allocator) void {
-        const failure = screen.thumbnail_fetch.failure;
         const bytes = screen.thumbnail_fetch.finish();
         if (bytes == null) screen.thumbnail_fetch.deinit();
         defer if (bytes) |downloaded| gpa.free(downloaded);
@@ -590,12 +693,9 @@ pub const ModCatalogue = struct {
             pending.gpa.free(id);
             screen.thumbnail_of = null;
         }
-        if (bytes) |downloaded| {
-            _ = screen.thumbnails.keep(gpa, id, mod_manager.decodeThumbnail(gpa, downloaded, id));
-        } else {
-            log.warn("{s}: can't download the thumbnail: {s}", .{ id, failure.words() });
-            _ = screen.thumbnails.keep(gpa, id, null);
-        }
+        // A download that failed was logged by the fetch.
+        const image = if (bytes) |downloaded| mod_manager.decodeThumbnail(gpa, downloaded, id) else null;
+        _ = screen.thumbnails.keep(gpa, id, image);
     }
 
     /// The item under the pointer at `at`: a button, a list arrow, or a visible row, which is a mod's
@@ -652,14 +752,23 @@ pub const ModCatalogue = struct {
     fn drawList(screen: ModCatalogue, canvas: Canvas, art: *hud.Art) canvas_module.Error!void {
         const font = canvas.fonts.small;
         if (screen.loaded == null) {
-            if (screen.problem) |why| {
-                try unreadable_note.write(canvas, font, canvas_module.red);
-                try canvas.text(font, note_below, why, canvas_module.red, .centre);
-            } else if (screen.fetch.state() == .running) {
+            if (screen.reading != null) {
                 try reading_note.write(canvas, font, canvas_module.blue);
+            } else if (screen.failed) |failed| {
+                try unreadable_note.write(canvas, font, canvas_module.red);
+                try canvas.text(font, note_below, failed.failure.words(), canvas_module.red, .centre);
             }
         } else if (screen.count() == 0) {
-            try empty_note.write(canvas, font, canvas_module.blue);
+            if (screen.failed) |failed| {
+                try unreadable_note.write(canvas, font, canvas_module.red);
+                try canvas.text(font, note_below, failed.failure.words(), canvas_module.red, .centre);
+            } else {
+                try empty_note.write(canvas, font, canvas_module.blue);
+            }
+        } else if (screen.failed) |failed| {
+            // The other repositories' mods are listed; the one that can't be read is named above.
+            var note: [name_buffer]u8 = undefined;
+            try canvas.text(font, repository_note_at, repositoryNote(&note, failed), canvas_module.red, .right);
         }
         for (screen.list.rows.first..screen.list.rows.end(), 0..) |row, place| {
             var named: [name_buffer]u8 = undefined;
@@ -715,8 +824,9 @@ pub const ModCatalogue = struct {
             .{ .prefix = "VERSION ", .value = entry.version, .colour = canvas_module.blue },
             .{ .prefix = "BY ", .value = entry.author, .colour = canvas_module.blue },
             .{ .prefix = "IN ", .value = if (entry.category) |path| pathText(&category_buffer, path) else null, .colour = canvas_module.blue },
+            .{ .prefix = "FROM ", .value = entry.repository, .colour = canvas_module.blue },
             .{ .prefix = "NEEDS OPENRELIANT ", .value = entry.openreliant, .colour = if (too_new) canvas_module.red else canvas_module.blue },
-            .{ .prefix = "SIZE ", .value = if (entry.size) |size| sizeText(&size_buffer, size) else null, .colour = canvas_module.blue },
+            .{ .prefix = "SIZE ", .value = sizeText(&size_buffer, entry.size), .colour = canvas_module.blue },
         };
         for (facts) |fact| if (fact.value) |value| {
             var line_buffer: [name_buffer]u8 = undefined;
@@ -738,9 +848,10 @@ pub const ModCatalogue = struct {
     }
 
     /// The status line of the mod at `index` in the catalogue, written into `buffer`: the download's
-    /// progress, the result of its install, that it needs a newer OpenReliant, or the installed
-    /// version and, if the catalogue's is newer, the update. Null when there is nothing to say. The
-    /// versions are shown as the manifest and the catalogue write them.
+    /// progress, the result of its install, that it needs a newer OpenReliant, that a folder mod of
+    /// its name was installed by hand, or the installed version and, if the catalogue's is newer,
+    /// the update. Null when there is nothing to say. The versions are shown as the manifest and
+    /// the catalogue write them.
     fn statusLine(screen: ModCatalogue, buffer: *[name_buffer]u8, index: u8) ?Note {
         const entry = screen.entries()[index];
         if (screen.installing == index) {
@@ -760,8 +871,12 @@ pub const ModCatalogue = struct {
         // Installed, in gold as the mods screen's RESTART TO APPLY note is, so that it stands out.
         return switch (screen.statusOf(entry)) {
             .absent => null,
-            .installed => |version| {
-                const have = version orelse return .{ .text = "INSTALLED", .colour = canvas_module.gold };
+            .installed => |installed| {
+                if (installed.folder) {
+                    const have = installed.version orelse return .{ .text = by_hand_note, .colour = canvas_module.gold };
+                    return .{ .text = std.mem.print(buffer, "INSTALLED {s} BY HAND AS A FOLDER: INSTALL WON'T REPLACE IT", .{have}) catch by_hand_note, .colour = canvas_module.gold };
+                }
+                const have = installed.version orelse return .{ .text = "INSTALLED", .colour = canvas_module.gold };
                 if (screen.actionFor(index) == .update) {
                     return .{ .text = std.mem.print(buffer, "INSTALLED {s}, UPDATE TO {s}", .{ have, entry.version.? }) catch "UPDATE AVAILABLE", .colour = canvas_module.gold };
                 }
@@ -782,6 +897,16 @@ pub const ModCatalogue = struct {
 
 /// A line of the panel's status, with its colour.
 const Note = struct { text: []const u8, colour: [3]f32 };
+
+/// The note about the repository `failed`, which couldn't be read, written into `buffer`: its
+/// name and why, such as `CAN'T READ MINE: NOT FOUND ON THE SERVER`.
+fn repositoryNote(buffer: *[name_buffer]u8, failed: Failed) []const u8 {
+    var writer: Io.Writer = .fixed(buffer);
+    writer.writeAll("CAN'T READ ") catch {};
+    for (failed.name) |byte| writer.writeByte(std.ascii.toUpper(byte)) catch break;
+    writer.print(": {s}", .{failed.failure.words()}) catch {};
+    return writer.buffered();
+}
 
 /// The layout of the status line: up to two lines.
 const status_lines: Canvas.Lines = .{ .width = details_lines.width, .height = details_lines.height, .most = 2 };
@@ -849,9 +974,9 @@ fn nameCentre(place: usize) [2]i32 {
 }
 
 /// The test setup: a catalogue of three mods, two under `ships` and one without a category, a `mods`
-/// folder where two of them are installed, one in an older version, and no web access unless a
-/// test serves the files itself. The rows are the heading SHIPS, Alpha, Beta, the heading OTHER
-/// MODS, and Gamma.
+/// folder where two of them are installed, Alpha as an archive in an older version and Gamma as a
+/// folder copied in by hand, and no web access unless a test serves the files itself. The rows are
+/// the heading SHIPS, Alpha, Beta, the heading OTHER MODS, and Gamma.
 const Fixture = struct {
     tmp: std.testing.TmpDir,
     arena: std.heap.ArenaAllocator,
@@ -862,45 +987,64 @@ const Fixture = struct {
     /// No mod offers options.
     options: mod_options.Recorder = .{ .mod = "", .page = .{ .title = "", .options = &.{} } },
 
-    /// The catalogue, with Alpha's archive at `archive` and its checksum file at `checksum`, which
-    /// `index` fills in.
+    /// A digest for the mods whose archives are nowhere.
+    const some_digest = "abababababababababababababababababababababababababababababababab";
+
+    /// The catalogue, with Alpha's archive at `archive`, of `size` bytes and with the digest
+    /// `digest`, which `index` fills in. Gamma is offered in a newer version than the folder's.
     const index_template =
         \\{{"format": 1, "mods": [
         \\  {{"id": "alpha", "name": "Alpha mod", "category": "ships/fighters", "version": "1.3", "author": "Someone", "openreliant": "0.7",
-        \\   "size": 5624773, "description": "Changes the alpha.", "archive": "{s}", "checksum": "{s}"}},
+        \\   "size": {d}, "description": "Changes the alpha.", "archive": "{s}", "sha256": "{s}"}},
         \\  {{"id": "beta", "name": "Beta mod", "category": "ships/fighters/alliance", "version": "4.0.3", "openreliant": "99.0",
-        \\   "archive": "https://example.invalid/beta.hog"}},
-        \\  {{"id": "gamma", "version": "1.0", "archive": "https://example.invalid/gamma.hog"}}
+        \\   "size": 1, "archive": "https://example.invalid/beta.hog", "sha256": "
+    ++ some_digest ++
+        \\"}},
+        \\  {{"id": "gamma", "version": "2.0", "size": 1, "archive": "https://example.invalid/gamma.hog", "sha256": "
+    ++ some_digest ++
+        \\"}}
         \\]}}
     ;
 
-    /// The index with Alpha's archive at `archive` and its checksum file at `checksum`.
-    fn index(buffer: []u8, archive: []const u8, checksum: []const u8) []const u8 {
-        return std.mem.print(buffer, index_template, .{ archive, checksum }) catch unreachable;
+    /// The index with Alpha's archive at `archive`, of `size` bytes and with the digest `digest`.
+    fn index(buffer: []u8, archive: []const u8, size: usize, digest: []const u8) []const u8 {
+        return std.mem.print(buffer, index_template, .{ size, archive, digest }) catch unreachable;
     }
 
-    /// Opens the screen on the catalogue `text`, as if it had been downloaded.
+    /// The settings file with an empty section of repositories, so that the screen reads nothing.
+    const no_repositories = "[OpenReliantModRepositories]\n";
+
+    /// Opens the screen on the catalogue `text`, as if it had been downloaded from the repository
+    /// `test`, with `no_repositories` to read.
     fn init(fixture: *Fixture, text: []const u8) !void {
+        try fixture.initWith(text, no_repositories);
+    }
+
+    /// Opens the screen with `settings_text` as the settings file, and the catalogue `text`
+    /// already read, or none to read the repositories the settings file names.
+    fn initWith(fixture: *Fixture, text: ?[]const u8, settings_text: []const u8) !void {
         const gpa = std.testing.allocator;
         const io = std.testing.io;
         fixture.tmp = std.testing.tmpDir(.{ .iterate = true });
         fixture.arena = .init(gpa);
-        try fixture.tmp.dir.createDirPath(io, "mods/alpha");
-        try fixture.tmp.dir.writeFile(io, .{ .sub_path = "mods/alpha/mod.ini", .data = "[Mod]\nName=Alpha mod\nVersion=1.2\n" });
         try fixture.tmp.dir.createDirPath(io, "mods/gamma");
+        try hog.testing.write(gpa, io, fixture.tmp.dir, "mods/alpha.hog", &.{.{ .name = "mod.ini", .data = "[Mod]\nName=Alpha mod\nVersion=1.2\n" }});
         try fixture.tmp.dir.writeFile(io, .{ .sub_path = "mods/gamma/mod.ini", .data = "[Mod]\nName=Gamma mod\nVersion=1.0\n" });
-        fixture.file = .{ .arena = fixture.arena.allocator(), .profile = .{ .text = "" } };
+        fixture.file = .{ .arena = fixture.arena.allocator(), .profile = .{ .text = settings_text } };
         fixture.mods = try .openOrdered(gpa, io, fixture.tmp.dir, null, .{ .profile = fixture.file.profile });
         fixture.keyboard = .{};
         fixture.screen = .{};
-        fixture.screen.loaded = try catalogue.Catalogue.parse(gpa, text);
+        if (text) |given| {
+            fixture.screen.loaded = .init(gpa);
+            try fixture.screen.loaded.?.add(.{ .name = "test", .url = "" }, given);
+        }
         fixture.screen.enter(fixture.context(.{}));
     }
 
-    /// The index with Alpha's files nowhere.
+    /// The index with Alpha's archive nowhere.
     fn initOffline(fixture: *Fixture) !void {
         var buffer: [1024]u8 = undefined;
-        try fixture.init(index(&buffer, "https://example.invalid/alpha.hog", "https://example.invalid/alpha.hog.sha256"));
+        try fixture.init(index(&buffer, "https://example.invalid/alpha.hog", 5624773, some_digest));
     }
 
     fn deinit(fixture: *Fixture) void {
@@ -918,7 +1062,6 @@ const Fixture = struct {
             .game = fixture.tmp.dir,
             .version = .{ .major = 0, .minor = 9, .patch = 0 },
             .pages = fixture.options.pages(),
-            .catalogue = null,
         };
     }
 
@@ -946,20 +1089,27 @@ test "the rows are the catalogue's mods under their categories, and the panel sa
     try std.testing.expectEqualStrings("- OTHER MODS", screen.headingOf(&heading, 1));
     try std.testing.expectEqualStrings("SHIPS / FIGHTERS / ALLIANCE", pathText(&heading, "ships/fighters/alliance"));
     try std.testing.expectEqual(0, screen.chosen.?);
-    // Alpha is installed in 1.2 and the catalogue offers 1.3: an update. Beta needs OpenReliant 99:
-    // nothing can be done. Gamma is installed in the version the catalogue offers.
+    // Alpha is installed in 1.2 as an archive copied in by hand, and the catalogue offers 1.3: an
+    // update. Beta needs OpenReliant 99: nothing can be done. Gamma is installed as a folder, so
+    // the newer version the catalogue offers is left alone.
     try std.testing.expectEqual(.update, screen.actionFor(0));
     try std.testing.expectEqual(.none, screen.actionFor(1));
     try std.testing.expectEqual(.none, screen.actionFor(2));
-    try std.testing.expectEqualStrings("1.2", screen.statusOf(screen.entries()[0]).installed.?);
+    const alpha = screen.statusOf(screen.entries()[0]).installed;
+    try std.testing.expectEqualStrings("1.2", alpha.version.?);
+    try std.testing.expect(!alpha.folder);
+    try std.testing.expectEqual(null, alpha.repository);
     try std.testing.expectEqual(.absent, screen.statusOf(screen.entries()[1]));
+    try std.testing.expect(screen.statusOf(screen.entries()[2]).installed.folder);
     var buffer: [name_buffer]u8 = undefined;
     // The versions are shown as the manifest and the catalogue write them.
     try std.testing.expectEqualStrings("INSTALLED 1.2, UPDATE TO 1.3", screen.statusLine(&buffer, 0).?.text);
     try std.testing.expectEqualStrings("NEEDS OPENRELIANT 99.0", screen.statusLine(&buffer, 1).?.text);
-    try std.testing.expectEqualStrings("INSTALLED 1.0", screen.statusLine(&buffer, 2).?.text);
+    try std.testing.expectEqualStrings("INSTALLED 1.0 BY HAND AS A FOLDER: INSTALL WON'T REPLACE IT", screen.statusLine(&buffer, 2).?.text);
+    // The repository that can't be read is named above the list, in capitals.
+    try std.testing.expectEqualStrings("CAN'T READ MINE: NOT FOUND ON THE SERVER", repositoryNote(&buffer, .{ .gpa = std.testing.allocator, .name = @constCast("mine"), .failure = .not_found }));
     try std.testing.expectEqualStrings("Alpha mod 1.3", nameOf(&buffer, screen.entries()[0]));
-    try std.testing.expectEqualStrings("gamma 1.0", nameOf(&buffer, screen.entries()[2]));
+    try std.testing.expectEqualStrings("gamma 2.0", nameOf(&buffer, screen.entries()[2]));
 }
 
 test "clicking a name selects the mod, and INSTALL is active only when it does something" {
@@ -1021,16 +1171,17 @@ test "OK, MAIN MENU and Escape end the screen, saying whether a mod was installe
     try std.testing.expectEqual(Leave{ .mods = .{ .installed = false } }, fixture.click(Button.ok.rect().centre()).?);
 }
 
-test "a screen without a catalogue URL lists nothing" {
+test "a screen without repositories lists nothing" {
     var fixture: Fixture = undefined;
     try fixture.initOffline();
     defer fixture.deinit();
     var empty: ModCatalogue = .{};
     defer empty.deinit();
-    // The source gives no URL: nothing is read, and nothing is wrong.
+    // The settings file names no repository: nothing is read, and nothing is wrong.
     empty.enter(fixture.context(.{}));
     try std.testing.expectEqual(null, empty.loaded);
-    try std.testing.expectEqual(null, empty.problem);
+    try std.testing.expectEqual(null, empty.reading);
+    try std.testing.expectEqual(null, empty.failed);
     try std.testing.expectEqual(0, empty.count());
     try std.testing.expectEqual(0, empty.row_count);
     try std.testing.expectEqual(null, empty.chosen);
@@ -1041,20 +1192,16 @@ test "a screen without a catalogue URL lists nothing" {
 test "UPDATE downloads the mod into the mods folder, and the mods screen is told to read it" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const archive = "the alpha's archive";
-    var line_buffer: [128]u8 = undefined;
-    var line: Io.Writer = .fixed(&line_buffer);
-    try checksums.writeLine(&line, checksums.digest(archive), "alpha.hog");
+    // The archive is a real one, so that the mods folder lists it once it is installed.
+    const archive = try hog.build(gpa, &.{.{ .name = "mod.ini", .data = "[Mod]\nName=Alpha mod\nVersion=1.3\n" }});
+    defer gpa.free(archive);
+    const digest = std.fmt.bytesToHex(checksums.digest(archive), .lower);
     var fixture: Fixture = undefined;
     var server: catalogue.testing.Server = undefined;
-    try server.start(io, &.{
-        .{ .path = "/alpha.hog", .body = archive },
-        .{ .path = "/alpha.hog.sha256", .body = line.buffered() },
-    });
+    try server.start(io, &.{.{ .path = "/alpha.hog", .body = archive }});
     var archive_url: [128]u8 = undefined;
-    var checksum_url: [128]u8 = undefined;
     var text: [1024]u8 = undefined;
-    try fixture.init(Fixture.index(&text, server.url(&archive_url, "/alpha.hog"), server.url(&checksum_url, "/alpha.hog.sha256")));
+    try fixture.init(Fixture.index(&text, server.url(&archive_url, "/alpha.hog"), archive.len, &digest));
     defer fixture.deinit();
     defer server.stop(gpa, fixture.screen.httpClient().?);
     const screen = &fixture.screen;
@@ -1075,8 +1222,15 @@ test "UPDATE downloads the mod into the mods folder, and the mods screen is told
     try std.testing.expectEqualStrings("INSTALLED: RESTART TO APPLY", screen.statusLine(&buffer, 0).?.text);
     const written = try fixture.tmp.dir.readFileAlloc(io, "mods/alpha.hog", gpa, .limited(1024));
     defer gpa.free(written);
-    try std.testing.expectEqualStrings(archive, written);
+    try std.testing.expectEqualSlices(u8, archive, written);
     try fixture.tmp.dir.access(io, "mods/alpha.hog.sha256", .{});
+    // The install is recorded with its repository, and the panel knows the new version and the
+    // repository from then on: nothing is left to update.
+    try std.testing.expectEqualStrings("[OpenReliantModRepositories]\n[OpenReliantInstalledMods]\nalpha.hog=test\n", fixture.file.profile.text);
+    const installed = screen.statusOf(screen.entries()[0]).installed;
+    try std.testing.expectEqualStrings("1.3", installed.version.?);
+    try std.testing.expectEqualStrings("test", installed.repository.?);
+    try std.testing.expectEqual(.none, screen.actionFor(0));
     try std.testing.expectEqual(Leave{ .mods = .{ .installed = true } }, fixture.click(Button.ok.rect().centre()).?);
 }
 
@@ -1086,4 +1240,53 @@ test sizeText {
     try std.testing.expectEqualStrings("1.0 MB", sizeText(&buffer, 1024 * 1024));
     try std.testing.expectEqualStrings("73 KB", sizeText(&buffer, 74285));
     try std.testing.expectEqualStrings("0 KB", sizeText(&buffer, 0));
+}
+
+test "the repositories are read one after another, and one that can't be read is named" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const first_index = "{\"mods\": [{\"id\": \"alpha\", \"size\": 1, \"archive\": \"/alpha.hog\", \"sha256\": \"" ++ Fixture.some_digest ++ "\"}]}";
+    const second_index = "{\"mods\": [{\"id\": \"alpha\", \"size\": 2, \"archive\": \"/other.hog\", \"sha256\": \"" ++ Fixture.some_digest ++ "\"}, {\"id\": \"beta\", \"size\": 1, \"archive\": \"/beta.hog\", \"sha256\": \"" ++ Fixture.some_digest ++ "\"}]}";
+    var server: catalogue.testing.Server = undefined;
+    try server.start(io, &.{
+        .{ .path = "/first.json", .body = first_index },
+        .{ .path = "/second.json", .body = second_index },
+    });
+    var first_url: [128]u8 = undefined;
+    var missing_url: [128]u8 = undefined;
+    var second_url: [128]u8 = undefined;
+    var text: [512]u8 = undefined;
+    const settings_text = try std.mem.print(&text, "[OpenReliantModRepositories]\nfirst={s}\nmissing={s}\nsecond={s}\n", .{ server.url(&first_url, "/first.json"), server.url(&missing_url, "/missing.json"), server.url(&second_url, "/second.json") });
+    var fixture: Fixture = undefined;
+    try fixture.initWith(null, settings_text);
+    defer fixture.deinit();
+    defer server.stop(gpa, fixture.screen.httpClient().?);
+    const screen = &fixture.screen;
+    // Entering the screen starts reading the first repository. Each pass takes one in and starts
+    // the next, until all three have been tried.
+    try std.testing.expectEqual(0, screen.reading.?);
+    try std.testing.expect(!screen.canReload());
+    var passes: usize = 0;
+    while (screen.reading != null) : (passes += 1) {
+        try std.testing.expect(passes < 3);
+        try screen.fetch.group.await(io);
+        try std.testing.expectEqual(null, screen.frame(fixture.context(.{})));
+    }
+    try std.testing.expectEqual(3, passes);
+    // The second repository's alpha is left out, since the first lists it, and its beta is added.
+    try std.testing.expectEqual(2, screen.count());
+    try std.testing.expectEqualStrings("alpha", screen.entries()[0].id);
+    try std.testing.expectEqualStrings("first", screen.entries()[0].repository);
+    try std.testing.expectEqual(1, screen.entries()[0].size);
+    try std.testing.expectEqualStrings("beta", screen.entries()[1].id);
+    try std.testing.expectEqualStrings("second", screen.entries()[1].repository);
+    try std.testing.expectEqualStrings("missing", screen.failed.?.name);
+    try std.testing.expectEqual(.not_found, screen.failed.?.failure);
+    try std.testing.expect(screen.canReload());
+    try std.testing.expectEqual(0, screen.chosen.?);
+    // RELOAD reads them again, forgetting the failure until it happens again.
+    try std.testing.expectEqual(null, fixture.click(Button.reload.rect().centre()));
+    try std.testing.expectEqual(0, screen.reading.?);
+    try std.testing.expectEqual(null, screen.failed);
+    try std.testing.expect(screen.loaded != null);
 }

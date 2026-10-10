@@ -306,10 +306,11 @@ pub const Mod = struct {
 
     /// Opens the mod `name` in the `mods` folder `folder` (`Source.open`), with its manifest if it
     /// has one, and if `check` is set and it is an archive, what its checksum file says of it
-    /// (`checksumOf`). Returns null, with a message in the log, if it isn't a mod or can't be
-    /// opened.
-    fn open(gpa: Allocator, io: Io, folder: Io.Dir, name: []const u8, kind: Io.File.Kind, check: bool) Allocator.Error!?Mod {
-        const checksum: Checksum = if (check and kind == .file and isArchive(name)) try checksumOf(gpa, io, folder, name) else .none;
+    /// (`checksumOf`). `installed` says whether the GET MODS screen installed the archive, which
+    /// then must have its checksum file. Returns null, with a message in the log, if it isn't a
+    /// mod or can't be opened.
+    fn open(gpa: Allocator, io: Io, folder: Io.Dir, name: []const u8, kind: Io.File.Kind, check: bool, installed: bool) Allocator.Error!?Mod {
+        const checksum: Checksum = if (check and kind == .file and isArchive(name)) try checksumOf(gpa, io, folder, name, installed) else .none;
         var source = Source.open(gpa, io, folder, name, kind) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.NotAMod => {
@@ -344,12 +345,19 @@ pub const Mod = struct {
 /// What the checksum file next to the archive `name` in the `mods` folder `folder` says of it (the
 /// archive's name plus `checksums.extension`, matched in any case): none if there's no such file,
 /// or whether the archive matches. If it doesn't match, or the file can't be read or used, the
-/// archive is damaged or isn't the one the checksum was made for, and the log says so.
-fn checksumOf(gpa: Allocator, io: Io, folder: Io.Dir, name: []const u8) Allocator.Error!Mod.Checksum {
+/// archive is damaged or isn't the one the checksum was made for, and the log says so. An archive
+/// the GET MODS screen `installed` has a checksum file from its install, so a missing one counts
+/// as a mismatch too: the archive isn't the one that was installed.
+fn checksumOf(gpa: Allocator, io: Io, folder: Io.Dir, name: []const u8, installed: bool) Allocator.Error!Mod.Checksum {
     var named: [files.max_path]u8 = undefined;
     const checksum_name = std.mem.print(&named, "{s}" ++ checksums.extension, .{name}) catch return .none;
     var found: [files.max_path]u8 = undefined;
-    const path = files.find(io, folder, checksum_name, &found) orelse return .none;
+    const path = files.find(io, folder, checksum_name, &found) orelse {
+        if (!installed) return .none;
+        const missing = "GET MODS installed it, but its checksum file is missing";
+        log.warn("skipping the mod {s}: {s}", .{ name, missing });
+        return .{ .mismatch = missing };
+    };
     const failure: []const u8 = failed: {
         const text = files.readFile(io, gpa, folder, path, .limited(max_checksum_size)) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
@@ -535,7 +543,8 @@ pub const Mods = struct {
         for (entries.items) |entry| {
             // A mod that is off isn't checked against its checksum, as none of it is used.
             const on = order.isOn(entry.name);
-            var mod = try Mod.open(gpa, io, folder, entry.name, entry.kind, on) orelse continue;
+            const recorded = order.installedFrom(entry.name) != null;
+            var mod = try Mod.open(gpa, io, folder, entry.name, entry.kind, on, recorded) orelse continue;
             if (running) |version| if (mod.needsLater(version)) |needed| {
                 log.warn("skipping the mod {f}: it needs OpenReliant {f}, and this is {f}", .{ mod, needed, version });
                 mod.close(gpa);
@@ -1452,4 +1461,37 @@ test effectOf {
     try std.testing.expectEqual(.added, effectOf(mods.list, 1, own, "logo.tga"));
     // The first mod has no earlier mod's files to replace.
     try std.testing.expectEqual(.added, effectOf(mods.list, 0, own, "hull.tga"));
+}
+
+test "an archive GET MODS installed loads only with its checksum file" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, folder_name);
+    const bytes = try hog.build(gpa, &.{.{ .name = "ship.shp", .data = "a mod's ship" }});
+    defer gpa.free(bytes);
+    // `viper.hog` was installed by GET MODS and has lost its checksum file; `coyote.hog` was copied
+    // in by hand, and loads unchecked.
+    try tmp.dir.writeFile(io, .{ .sub_path = "mods/viper.hog", .data = bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mods/coyote.hog", .data = bytes });
+    const order: Order = .{ .profile = .{ .text = "[OpenReliantInstalledMods]\nviper.hog=openreliant-mods\n" } };
+    var mods: Mods = try .openOrdered(gpa, io, tmp.dir, null, order);
+    defer mods.close(gpa);
+    try std.testing.expectEqual(1, mods.list.len);
+    try std.testing.expectEqualStrings("coyote.hog", mods.list[0].name);
+    try std.testing.expectEqual(.none, mods.list[0].checksum);
+    try std.testing.expectEqual(1, mods.damaged.len);
+    try std.testing.expectEqualStrings("viper.hog", mods.damaged[0].name);
+    try std.testing.expectEqualStrings("GET MODS installed it, but its checksum file is missing", mods.damaged[0].checksum.mismatch);
+    // With its checksum file back, it loads.
+    var buffer: [128]u8 = undefined;
+    var line: Io.Writer = .fixed(&buffer);
+    try checksums.writeLine(&line, checksums.digest(bytes), "viper.hog");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mods/viper.hog.sha256", .data = line.buffered() });
+    var again: Mods = try .openOrdered(gpa, io, tmp.dir, null, order);
+    defer again.close(gpa);
+    try std.testing.expectEqual(2, again.list.len);
+    try std.testing.expectEqualStrings("viper.hog", again.list[1].name);
+    try std.testing.expectEqual(.matches, again.list[1].checksum);
 }

@@ -83,7 +83,7 @@ const restart_note: Label = .{
     .at = .{ details_frame.at[0] + details_frame.extent[0], list_frame.at[1] - restart_note_above },
     .alignment = .right,
 };
-const restart_note_above = 18;
+pub const restart_note_above = 18;
 
 /// The title, in the place of the settings screen's tabs.
 const title: Label = .{ .text = .{ .words = "MODS" }, .at = .{ 320, settings.title_y }, .alignment = .centre };
@@ -155,8 +155,8 @@ const options_label_from = 33;
 const options_rect: Rect = .{ .x = @intCast(options_button_at[0]), .y = @intCast(options_button_at[1]), .width = 100, .height = 15 };
 
 /// GET MODS, above the list's frame on the left, opposite the restart note: a button with the
-/// settings screen's shapes that opens the GET MODS screen (`mod_catalogue`). Shown only when a
-/// catalogue URL is given (`Source.catalogue`).
+/// settings screen's shapes that opens the GET MODS screen (`mod_catalogue`). Shown only when the
+/// settings file names a repository to read (`bigfile.catalogue.Repositories`).
 const catalogue_button_at: [2]i32 = .{ list_frame.at[0], list_frame.at[1] - restart_note_above - 2 };
 const catalogue_button: canvas_module.Button = .{ .at = catalogue_button_at, .label = .{ .text = .{ .words = "GET MODS" }, .at = .{ catalogue_button_at[0] + options_label_from, catalogue_button_at[1] - 1 } } };
 const catalogue_rect: Rect = .{ .x = @intCast(catalogue_button_at[0]), .y = @intCast(catalogue_button_at[1]), .width = 100, .height = 15 };
@@ -334,9 +334,6 @@ pub const Source = struct {
     version: ?std.SemanticVersion,
     /// The pages of options the mods' scripts offer.
     pages: mod_options.Pages,
-    /// The URL of the catalogue of mods on the web (`bigfile.catalogue`), which GET MODS opens. Null
-    /// hides GET MODS.
-    catalogue: ?[]const u8 = null,
 };
 
 /// The screen's state.
@@ -359,7 +356,7 @@ pub const ModManager = struct {
     /// Whether the chosen mod's scripts offer a page of options, which OPTIONS opens; kept up to date
     /// as each pass begins.
     has_options: bool = false,
-    /// Whether a catalogue URL is given, so GET MODS is shown.
+    /// Whether the settings file names a repository of mods, so GET MODS is shown.
     has_catalogue: bool = false,
     /// The mods REFRESH opened, which the rows are of from then on, until the screen is left
     /// (`release`).
@@ -380,7 +377,7 @@ pub const ModManager = struct {
         screen.list = .of(screen.count, shown_rows, context.ticks);
         if (screen.count > 0) screen.chosen = 0;
         screen.has_options = screen.optionsOf(context.source) != null;
-        screen.has_catalogue = context.source.catalogue != null;
+        screen.has_catalogue = bigfile.catalogue.Repositories.of(context.settings_file.profile).any();
         screen.showThumbnail(context.source);
     }
 
@@ -477,7 +474,7 @@ pub const ModManager = struct {
         screen.lit = null;
         screen.list.scrollBy(pointer.wheel, context.keyboard, context.ticks);
         screen.has_options = screen.optionsOf(context.source) != null;
-        screen.has_catalogue = context.source.catalogue != null;
+        screen.has_catalogue = bigfile.catalogue.Repositories.of(context.settings_file.profile).any();
         const under = screen.itemAt(pointer.at) orelse return null;
         if (!pointer.down) {
             screen.lit = under;
@@ -1119,18 +1116,18 @@ test "the list scrolls, and OK, MAIN MENU and Escape end the screen" {
     try std.testing.expectEqual(Leave{ .end = .back }, fixture.screen.frame(fixture.context(.{})).?);
 }
 
-test "GET MODS opens the catalogue screen when a catalogue URL is given" {
+test "GET MODS opens the catalogue screen when the settings file names a repository" {
     var fixture: Fixture = undefined;
-    try fixture.init("");
+    // With an empty section of repositories, there is no button.
+    try fixture.init("[OpenReliantModRepositories]\n");
     defer fixture.deinit();
-    // Without a catalogue URL, there is no button.
     try std.testing.expectEqual(null, fixture.screen.itemAt(catalogue_rect.centre()));
     try std.testing.expectEqual(null, fixture.click(catalogue_rect.centre()));
-    var context = fixture.context(.{ .at = catalogue_rect.centre(), .down = true });
-    context.source.catalogue = "https://example.invalid/mods.json";
-    fixture.screen.enter(context);
+    // Without the section, the default repository stands, and the button with it.
+    fixture.file.profile = .{ .text = "" };
+    fixture.screen.enter(fixture.context(.{}));
     try std.testing.expectEqual(Item.catalogue, fixture.screen.itemAt(catalogue_rect.centre()).?);
-    try std.testing.expectEqual(Leave.catalogue, fixture.screen.frame(context).?);
+    try std.testing.expectEqual(Leave.catalogue, fixture.click(catalogue_rect.centre()).?);
 }
 
 test "a mod the settings file can't keep stays on and in place" {
