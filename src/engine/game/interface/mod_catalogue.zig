@@ -849,8 +849,8 @@ pub const ModCatalogue = struct {
 
     /// The status line of the mod at `index` in the catalogue, written into `buffer`: the download's
     /// progress, the result of its install, that it needs a newer OpenReliant, that a folder mod of
-    /// its name was installed by hand, or the installed version and, if the catalogue's is newer,
-    /// the update. Null when there is nothing to say. The versions are shown as the manifest and
+    /// its name was installed by hand, or the installed version, BY HAND where the settings file
+    /// doesn't record the install, and, if the catalogue's is newer, the update. Null when there is nothing to say. The versions are shown as the manifest and
     /// the catalogue write them.
     fn statusLine(screen: ModCatalogue, buffer: *[name_buffer]u8, index: u8) ?Note {
         const entry = screen.entries()[index];
@@ -876,11 +876,13 @@ pub const ModCatalogue = struct {
                     const have = installed.version orelse return .{ .text = by_hand_note, .colour = canvas_module.gold };
                     return .{ .text = std.mem.print(buffer, "INSTALLED {s} BY HAND AS A FOLDER: INSTALL WON'T REPLACE IT", .{have}) catch by_hand_note, .colour = canvas_module.gold };
                 }
-                const have = installed.version orelse return .{ .text = "INSTALLED", .colour = canvas_module.gold };
+                // An archive the settings file doesn't record was copied in by hand.
+                const how: []const u8 = if (installed.repository == null) " BY HAND" else "";
+                const have = installed.version orelse return .{ .text = if (installed.repository == null) "INSTALLED BY HAND" else "INSTALLED", .colour = canvas_module.gold };
                 if (screen.actionFor(index) == .update) {
-                    return .{ .text = std.mem.print(buffer, "INSTALLED {s}, UPDATE TO {s}", .{ have, entry.version.? }) catch "UPDATE AVAILABLE", .colour = canvas_module.gold };
+                    return .{ .text = std.mem.print(buffer, "INSTALLED {s}{s}, UPDATE TO {s}", .{ have, how, entry.version.? }) catch "UPDATE AVAILABLE", .colour = canvas_module.gold };
                 }
-                return .{ .text = std.mem.print(buffer, "INSTALLED {s}", .{have}) catch "INSTALLED", .colour = canvas_module.gold };
+                return .{ .text = std.mem.print(buffer, "INSTALLED {s}{s}", .{ have, how }) catch "INSTALLED", .colour = canvas_module.gold };
             },
         };
     }
@@ -1103,7 +1105,7 @@ test "the rows are the catalogue's mods under their categories, and the panel sa
     try std.testing.expect(screen.statusOf(screen.entries()[2]).installed.folder);
     var buffer: [name_buffer]u8 = undefined;
     // The versions are shown as the manifest and the catalogue write them.
-    try std.testing.expectEqualStrings("INSTALLED 1.2, UPDATE TO 1.3", screen.statusLine(&buffer, 0).?.text);
+    try std.testing.expectEqualStrings("INSTALLED 1.2 BY HAND, UPDATE TO 1.3", screen.statusLine(&buffer, 0).?.text);
     try std.testing.expectEqualStrings("NEEDS OPENRELIANT 99.0", screen.statusLine(&buffer, 1).?.text);
     try std.testing.expectEqualStrings("INSTALLED 1.0 BY HAND AS A FOLDER: INSTALL WON'T REPLACE IT", screen.statusLine(&buffer, 2).?.text);
     // The repository that can't be read is named above the list, in capitals.
