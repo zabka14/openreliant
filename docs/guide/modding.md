@@ -126,7 +126,9 @@ The manifest's other sections list what the mod runs and adds:
 
 The original never reads a file called `mod.ini`, so an archive with a manifest still works with it,
 and the manifest doesn't replace any game file. Neither does the thumbnail, `mod.png`
-([The thumbnail](#the-thumbnail)).
+([The thumbnail](#the-thumbnail)), a licence notice called `license.txt`, or a Markdown file such
+as `README.md`. These belong to the mod, so two mods that each carry a `license.txt` don't
+replace each other's.
 
 ## Load order
 
@@ -1217,9 +1219,11 @@ most:
 | List a stats table | `sltool stats list <stats.bin>` |
 
 `sltool help` lists every command, and the [README](../../README.md#reverse-engineering--analysis-tools)
-links each one to its format's page. `openreliant` has two commands for mod makers too:
-`openreliant missions` checks missions ([Checking a mission](#checking-a-mission)), and
-`openreliant hooks` lists the hooks scripts can use ([Hooks](scripting.md#hooks)).
+links each one to its format's page. `openreliant` has three commands for mod makers too:
+`openreliant missions` checks missions ([Checking a mission](#checking-a-mission)),
+`openreliant hooks` lists the hooks scripts can use ([Hooks](scripting.md#hooks)), and
+`openreliant debug` steps through a mission's script as the game plays it
+([Debugging mission scripts](debugging.md)).
 
 ## Sharing a mod
 

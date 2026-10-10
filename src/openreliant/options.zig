@@ -56,6 +56,9 @@ pub const Arg = enum {
     @"--no-mods",
     @"--no-intro",
     @"--developer-mode",
+    @"--editor-link",
+    @"--editor-link-port",
+    @"--no-update-check",
     @"--screenshot",
     @"--screenshot-ticks",
     @"--seed",
@@ -143,6 +146,9 @@ const docs: std.enums.EnumArray(Arg, Doc) = .init(.{
 
     .@"--no-intro" = .{ .section = .other, .text = "start without the three movies the game plays as it starts, as --mission and --screenshot do" },
     .@"--developer-mode" = .{ .section = .other, .text = "the tools for writing mods' scripts: the scripting console, which F11 brings up where a mod has scripts, and folder mods' scripts reloading when they or their shaders are saved" },
+    .@"--editor-link" = .{ .section = .other, .text = "listen for a mission editor or a script debugger, such as openreliant debug, on this computer's own address, 127.0.0.1, which can then pause the mission and stop and step its script, as the original's editor link does" },
+    .@"--editor-link-port" = .{ .section = .other, .value = "<port>", .text = std.fmt.comptimePrint("with --editor-link, the port to listen at; {d} by default", .{platform.link.default_port}) },
+    .@"--no-update-check" = .{ .section = .other, .text = "don't check for a newer release of OpenReliant. By default it checks as it starts, logs a newer release and shows it once in the main menu" },
     .@"--screenshot" = .{ .section = .other, .value = "<file.png>", .text = "draw one frame, with the camera settled, to a PNG, and quit; the controls, the [OpenReliant] settings and the details in [Device] are not read, so that it comes out the same each time; the mods the mods screen turned off stay off" },
     .@"--screenshot-ticks" = .{ .section = .other, .value = "<ticks>", .text = "with --screenshot, how many game ticks to run first, one a frame, so that the scene plays out; 2 by default" },
     .@"--seed" = .{ .section = .other, .value = "<number>", .text = "start each mission's random numbers from this seed, so that a run comes out the same each time, for testing; by default, as in the game, from the clock as the mission starts, and from a fixed seed with --screenshot" },
@@ -159,6 +165,7 @@ pub const help_page = page: {
         \\       openreliant joysticks [<game-directory>] [--watch]
         \\       openreliant missions [<game-directory>] [--no-mods]
         \\       openreliant hooks [<hook>] [--definitions]
+        \\       openreliant debug [--port <port>]
         \\
         \\
     ++ help.table(&.{.{ .typed = "<game-directory>", .text = "where StarLancer is installed, with resource.hog and tcachehw.dat; by default the first that holds the game of the current directory, the directories in it, the directory openreliant is in and the directories beside it" }}) ++
@@ -260,6 +267,11 @@ pub const Options = struct {
     /// Whether the tools for writing mods' scripts are on: the scripting console, and folder mods'
     /// scripts reloading as they're saved (`console.Driver`).
     developer_mode: bool = false,
+    /// Whether an editor can link to the game (`engine.link`), and the port it connects to.
+    editor_link: bool = false,
+    editor_link_port: u16 = platform.link.default_port,
+    /// Whether OpenReliant checks for a newer release of itself as it starts (`updates.zig`).
+    update_check: bool = true,
     /// Whether the original's look and sound were taken (`--original`), which the options after it
     /// change.
     original: bool = false,
@@ -469,6 +481,9 @@ pub const Options = struct {
 
             .@"--no-intro" => options.intro = false,
             .@"--developer-mode" => options.developer_mode = true,
+            .@"--editor-link" => options.editor_link = true,
+            .@"--editor-link-port" => options.editor_link_port = std.fmt.parseInt(u16, value, 10) catch return error.BadValue,
+            .@"--no-update-check" => options.update_check = false,
             .@"--fullscreen" => options.fullscreen = true,
             .@"--size" => options.settings.size = parseSize(value) orelse return error.BadValue,
             .@"--fps" => {
@@ -634,7 +649,9 @@ test Options {
     // Mods are loaded unless `--no-mods` is given.
     try std.testing.expect((try parsed(&.{})).mods);
     try std.testing.expect(!(try parsed(&.{"--no-mods"})).mods);
-
+    // The check for a newer release is on, with `--original` too, until `--no-update-check`.
+    try std.testing.expect((try parsed(&.{"--original"})).update_check);
+    try std.testing.expect(!(try parsed(&.{"--no-update-check"})).update_check);
     // As the game has it unless told otherwise.
     try std.testing.expectEqual(null, (try parsed(&.{})).difficulty);
     try std.testing.expectEqual(.hard, (try parsed(&.{ "--difficulty", "hard" })).difficulty.?);
